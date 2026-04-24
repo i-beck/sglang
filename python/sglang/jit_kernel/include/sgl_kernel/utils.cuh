@@ -259,14 +259,20 @@ struct LaunchKernel {
     m_config.numAttrs = 0;
 #else
     if (enabled) {
-      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
-      m_config.numAttrs = 1;
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
-    } else {
-      m_config.numAttrs = 0;
     }
 #endif
+    return *this;
+  }
+
+  auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
+    auto& attr = m_attrs[m_config.numAttrs++];
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
+    m_config.attrs = m_attrs;
     return *this;
   }
 
@@ -303,7 +309,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[1];
+  cudaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host

@@ -5,13 +5,21 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    is_deepseek_compressed,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+    DeepSeekV4IndexerPool,
+    DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
@@ -191,6 +199,86 @@ class ModelRunnerKVCacheMixin:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def set_num_tokens_hybrid_swa_compress(self: ModelRunner):
+        from sglang.srt.model_executor.memory_profiler import DSv4MemoryCalculator
+
+        self.state_dtype = torch.float32
+        logger.info(f"DSv4 compressed attention: kv_cache_dtype={self.kv_cache_dtype}")
+        logger.info(f"DSv4 compressed attention: state_dtype={self.state_dtype}")
+
+        page_size = self.server_args.page_size
+        assert (
+            page_size % 128 == 0
+        ), "page_size must be multiple of 128 for compressed attention"
+
+        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+            config = getattr(self.server_args, "_draft_pool_config", None)
+            assert (
+                config is not None
+            ), "Draft worker requires target's pool config but _draft_pool_config is not set."
+            self.full_max_total_num_tokens = config["full_max_total_num_tokens"]
+            self.swa_max_total_num_tokens = config["swa_max_total_num_tokens"]
+            self.c4_max_total_num_tokens = 0
+            self.c128_max_total_num_tokens = 0
+            self.c4_state_pool_size = 0
+            self.c128_state_pool_size = 0
+
+            logger.info(
+                f"DSv4 pool sizes (DRAFT): using TARGET's pool sizes - "
+                f"full={self.full_max_total_num_tokens}, "
+                f"swa={self.swa_max_total_num_tokens}"
+            )
+            return
+
+        c4_shrink = (
+            envs.SGLANG_OPT_HISPARSE_C4_SHRINK.get() if self.enable_hisparse else 1
+        )
+        if c4_shrink > 1:
+            logger.info(
+                f"HiSparse c4 pool shrink factor = {c4_shrink} "
+                f"(set via SGLANG_OPT_HISPARSE_C4_SHRINK)"
+            )
+        calculator = DSv4MemoryCalculator(
+            model_config=self.model_config,
+            page_size=page_size,
+            swa_ratio=self.server_args.swa_full_tokens_ratio,
+            is_speculative=self.server_args.speculative_algorithm is not None,
+            c4_shrink_factor=c4_shrink,
+        )
+
+        pool_sizes = calculator.get_pool_sizes_by_profiling(self)
+        if (
+            self.server_args.max_total_tokens is not None
+            and pool_sizes.full_max_total_num_tokens > self.max_total_num_tokens
+        ):
+            pool_sizes = calculator.get_pool_sizes_by_configuration(
+                max_total_tokens=self.max_total_num_tokens
+            )
+
+        self.full_max_total_num_tokens = pool_sizes.full_max_total_num_tokens
+        self.swa_max_total_num_tokens = pool_sizes.swa_max_total_num_tokens
+        self.c4_max_total_num_tokens = pool_sizes.c4_max_total_num_tokens
+        self.c128_max_total_num_tokens = pool_sizes.c128_max_total_num_tokens
+        self.c4_state_pool_size = pool_sizes.c4_state_pool_size
+        self.c128_state_pool_size = pool_sizes.c128_state_pool_size
+        self.max_total_num_tokens = self.full_max_total_num_tokens
+
+        if not self.spec_algorithm.is_none() and not self.is_draft_worker:
+            self.server_args._draft_pool_config = {
+                "full_max_total_num_tokens": self.full_max_total_num_tokens,
+                "swa_max_total_num_tokens": self.swa_max_total_num_tokens,
+            }
+
+        logger.info(
+            f"DSv4 pool sizes: "
+            f"full={self.full_max_total_num_tokens}, "
+            f"swa={self.swa_max_total_num_tokens}, "
+            f"c4={self.c4_max_total_num_tokens}, "
+            f"c128={self.c128_max_total_num_tokens}, "
+            f"c4_state={self.c4_state_pool_size}, "
+            f"c128_state={self.c128_state_pool_size}"
+        )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
@@ -282,11 +370,49 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
 
         # Check out-of-tree platform (plugin system) first
         from sglang.srt.platforms import current_platform
 
-        if current_platform.is_out_of_tree() and not self.mambaish_config:
+        if is_v4_model:
+            # DeepSeek V4 compressed attention pool
+            swa_page_size = self.page_size
+            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+
+            if self.is_draft_worker:
+                from sglang.srt.models.deepseek_v4_nextn import (
+                    COMPRESS_RATIO_NEXTN_LAYER,
+                )
+
+                compression_ratios = [
+                    COMPRESS_RATIO_NEXTN_LAYER
+                ] * self.num_effective_layers
+            else:
+                compression_ratios = self.model_config.compress_ratios
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=self.server_args.max_running_requests,
+                swa_size=self.swa_max_total_num_tokens,
+                c4_size=self.c4_max_total_num_tokens,
+                c128_size=self.c128_max_total_num_tokens,
+                c4_state_pool_size=self.c4_state_pool_size,
+                c128_state_pool_size=self.c128_state_pool_size,
+                page_size=self.page_size,
+                swa_page_size=swa_page_size,
+                dtype=self.kv_cache_dtype,
+                state_dtype=self.state_dtype,
+                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                indexer_head_dim=self.model_config.index_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                compression_ratios=compression_ratios,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                enable_hisparse=self.enable_hisparse,
+            )
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
                 PoolCls = current_platform.get_nsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
