@@ -10,13 +10,13 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    attn_tp_all_gather_into_tensor,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
-    attn_tp_all_gather_into_tensor,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -280,7 +280,6 @@ def _assert_cp_pure_extend(forward_batch: "ForwardBatch") -> None:
         f"(extend_seq_lens != seq_lens) at {mismatched[:5]}{'...' if len(mismatched) > 5 else ''}. "
         "A request has prior KV cache; CP round-robin may have domain mismatch."
     )
-
 
 
 def assert_tensor_identical_across_cp_ranks(

@@ -11,8 +11,6 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
@@ -840,7 +838,6 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
     )
-
 
 
 def fused_moe(

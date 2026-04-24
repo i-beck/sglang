@@ -678,7 +678,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
         super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
-
     def quantize_and_rope_for_fp8(
         self,
         q_nope: torch.Tensor,

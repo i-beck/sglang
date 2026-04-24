@@ -339,7 +339,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             for item in data_list
         ]
 
-
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -349,7 +348,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._extract_topk_base64(recv_obj.routed_experts)
         indexer_topk = self._extract_topk_base64(recv_obj.indexer_topk)
-
 
         return BatchStrOutput(
             rids=recv_obj.rids,

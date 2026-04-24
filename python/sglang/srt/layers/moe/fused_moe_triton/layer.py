@@ -1159,7 +1159,6 @@ class FusedMoE(torch.nn.Module):
             self.meta_overlap_args = None
 
 
-
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1407,7 +1406,6 @@ class FlashInferFP4MoE(FusedMoE):
         )[0]
 
         return result
-
 
 
 @register_custom_op(out_shape="hidden_states")

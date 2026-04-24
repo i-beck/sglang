@@ -14,6 +14,7 @@ from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.observability.metrics_collector import SchedulerStats
 

@@ -54,7 +54,6 @@ if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
-            from flashinfer.norm import rmsnorm as fi_rmsnorm
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):

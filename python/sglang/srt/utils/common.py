@@ -3941,7 +3941,6 @@ def get_or_create_event_loop():
         return loop
 
 
-
 def get_numa_node_count() -> int:
     """
     Get the number of NUMA nodes available on the system.
@@ -4051,6 +4050,8 @@ def bind_to_closest_numa_node_cuda():
     Uses `numa` library calls via ctypes to set the CPU affinity of the process.
     """
     if is_numa_available() and nvgpu_available():
+        from sglang.srt.utils.numa_utils import numa_bind_to_node
+
         node_id = get_current_device_numa_node_cuda()
         numa_bind_to_node(node_id)
 

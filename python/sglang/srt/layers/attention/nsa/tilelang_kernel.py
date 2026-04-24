@@ -6,7 +6,8 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
 
@@ -14,18 +15,25 @@ pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
+# TL_DISABLE_FAST_MATH has deprecated in v0.1.7.post1 tilelang
+if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
+elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
+
+_is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
-if is_hip():
+if _is_hip:
     FP8 = "float8_e5m2fnuz"
     FP8_ = torch.float8_e5m2
 else:
-    FP8 = "float8_e4m3"
+    FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
     FP8_ = torch.float8_e4m3fn
 FP32 = "float32"
 INT32 = "int32"
-
-_is_hip = is_hip()
 
 
 def fast_log2_ceil(x):

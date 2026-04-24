@@ -907,8 +907,6 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
-        self.hisparse_staging = False
-
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1497,8 +1495,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     prefill_stats: Optional[PrefillStats] = None
 
     # HiSparse
-    hisparse_coordinator: Optional[HiSparseCoordinator] = None
-
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod
@@ -2340,7 +2336,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.out_cache_loc,
                 self.req_pool_indices,
                 self.seq_lens_cpu,
-
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():

@@ -18,7 +18,6 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.deepseekv4_memory_pool import (
-    DeepSeekV4IndexerPool,
     DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
