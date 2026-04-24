@@ -8,7 +8,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 @dataclass
 class DeepSeekV4Config(PretrainedConfig):
-    architectures: List[str]
+    architectures: List[str] = field(default_factory=list)
     attention_bias: bool = False
     attention_dropout: float = 0.0
     bos_token_id: int = 0
