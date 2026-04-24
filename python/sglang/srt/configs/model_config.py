@@ -539,7 +539,17 @@ class ModelConfig:
             for arch in self.hf_config.architectures
         )
 
-        if self.is_hybrid_swa and not self.is_swa_with_compressed_attention:
+        if self.is_swa_with_compressed_attention:
+            # DeepseekV4: derive layer IDs from compress_ratios
+            # compress_ratio 0 = full attention, 4/128 = compressed (SWA)
+            compress_ratios = getattr(self.hf_text_config, "compress_ratios", [])
+            self.full_attention_layer_ids = [
+                i for i, r in enumerate(compress_ratios) if r == 0
+            ]
+            self.swa_attention_layer_ids = [
+                i for i, r in enumerate(compress_ratios) if r != 0
+            ]
+        elif self.is_hybrid_swa:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
