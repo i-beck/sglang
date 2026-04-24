@@ -425,13 +425,21 @@ def precompile_deep_gemm_shapes(hf_config, tp_size: int, server_args) -> None:
         logger.info(
             f"Precompiling <{kernel_type.name}> N={n}, K={k}, num_groups={num_groups}"
         )
-        _compile_deep_gemm_one_type_all(
-            kernel_type=kernel_type,
-            n=n,
-            k=k,
-            num_groups=num_groups,
-            m_list=_BUILTIN_M_LIST,
-        )
+        try:
+            _compile_deep_gemm_one_type_all(
+                kernel_type=kernel_type,
+                n=n,
+                k=k,
+                num_groups=num_groups,
+                m_list=_BUILTIN_M_LIST,
+            )
+        except RuntimeError as e:
+            logger.warning(
+                f"DeepGEMM precompilation failed for <{kernel_type.name}> "
+                f"N={n}, K={k}, num_groups={num_groups}: {e}. "
+                f"Will compile on-demand at runtime if needed."
+            )
+            _INITIALIZATION_DICT[query_key] = None  # allow retry at runtime
 
     logger.info("DeepGEMM precompilation complete")
 
