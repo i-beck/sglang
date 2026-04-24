@@ -883,12 +883,21 @@ class ModelRunnerKVCacheMixin:
             assert (
                 self.memory_pool_config is not None
             ), "Draft worker requires memory_pool_config"
+            self._apply_memory_pool_config(self.memory_pool_config)
+        elif getattr(self.model_config, "is_swa_with_compressed_attention", False):
+            # DeepSeek V4: use DSv4MemoryCalculator which handles per-layer
+            # compression ratios (0/4/128) and four separate KV pools.
+            self.total_gpu_memory = pre_model_load_memory
+            self.set_num_tokens_hybrid_swa_compress()
+            self.max_running_requests = self._resolve_max_num_reqs(
+                self.max_total_num_tokens
+            )
+            self._init_pools()
         else:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
             )
-
-        self._apply_memory_pool_config(self.memory_pool_config)
+            self._apply_memory_pool_config(self.memory_pool_config)
 
         logger.info(
             f"Memory pool end. "
