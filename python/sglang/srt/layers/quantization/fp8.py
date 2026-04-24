@@ -1173,6 +1173,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
+                # On Hopper (SM90), dequant FP4→FP8 since FP4 DeepGEMM needs SM100+
+                if not deep_gemm_wrapper.DEEPGEMM_BLACKWELL and will_use_deepgemm:
+                    self._dequant_fp4_experts_to_fp8(layer)
+                    return
+
                 if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
                     from sglang.srt.models.deepseek_v4 import (
                         build_mega_moe_experts_weights,
@@ -1228,6 +1233,84 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
+
+    def _dequant_fp4_experts_to_fp8(self, layer: Module) -> None:
+        """Dequantize FP4 (E2M1) expert weights to FP8 for Hopper (SM90).
+
+        FP4 DeepGEMM requires Blackwell (SM100+). On Hopper, we dequant
+        FP4→BF16→FP8 with 128×128 block scales so the standard FP8 path works.
+        """
+        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+        from sglang.srt.utils.common import ceil_align
+
+        # FP4 E2M1 lookup table: 4-bit index → float value
+        # Matches deep_gemm.utils.math._dequantize_from_fp4_e2m1
+        _fp4_e2m1_lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.bfloat16,
+        )
+
+        for weight_name, scale_name in [
+            ("w13_weight", "w13_weight_scale_inv"),
+            ("w2_weight", "w2_weight_scale_inv"),
+        ]:
+            weight_param = getattr(layer, weight_name)
+            scale_param = getattr(layer, scale_name)
+
+            packed = weight_param.data  # [num_experts, N, K//2] int8
+            scales = scale_param.data  # [num_experts, N, K//32] float
+            num_experts, N, K_half = packed.shape
+            K = K_half * 2
+
+            lut = _fp4_e2m1_lut.to(packed.device)
+
+            # Pre-allocate output tensors instead of list+stack
+            scale_rows = ceil_align(N, 128) // 128
+            scale_cols = ceil_align(K, 128) // 128
+            new_weight_tensor = torch.empty(
+                num_experts, N, K,
+                dtype=torch.float8_e4m3fn, device=packed.device,
+            )
+            new_scale_tensor = torch.empty(
+                num_experts, scale_rows, scale_cols,
+                dtype=torch.float32, device=packed.device,
+            )
+
+            # Mini-batch experts to reduce kernel launch overhead
+            batch_size = 8
+            for e_start in range(0, num_experts, batch_size):
+                e_end = min(e_start + batch_size, num_experts)
+                B = e_end - e_start
+
+                p = packed[e_start:e_end]  # [B, N, K//2] int8
+
+                # Unpack FP4 nibbles — use int32 via F.embedding (halves index memory vs int64)
+                unpacked = torch.empty(B, N, K, dtype=torch.int32, device=packed.device)
+                unpacked[:, :, 0::2] = (p & 0x0F).to(torch.int32)
+                unpacked[:, :, 1::2] = ((p >> 4) & 0x0F).to(torch.int32)
+                bf16_vals = F.embedding(unpacked, lut)  # [B, N, K] bfloat16
+
+                # Apply FP4 block scales (block_k=32) via reshape broadcast (no materialized expansion)
+                expert_scales = scales[e_start:e_end].float()  # [B, N, K//32]
+                scaled_vals = bf16_vals.float() * expert_scales.unsqueeze(-1).expand(
+                    B, N, K // 32, 32
+                ).reshape(B, N, K)
+
+                # Re-quantize each expert to FP8 (pass float32 directly, no lossy bf16 truncation)
+                for i in range(B):
+                    fp8_w, fp8_s = per_block_cast_to_fp8(scaled_vals[i])
+                    new_weight_tensor[e_start + i] = fp8_w
+                    new_scale_tensor[e_start + i] = fp8_s
+
+                del unpacked, bf16_vals, scaled_vals, expert_scales
+
+            setattr(layer, weight_name, Parameter(new_weight_tensor, requires_grad=False))
+            setattr(layer, scale_name, Parameter(new_scale_tensor, requires_grad=False))
+            getattr(layer, scale_name).format_ue8m0 = False
+
+        self.is_fp4_expert = False
+        logger.info("Converted FP4 expert weights to FP8 for Hopper (SM90)")
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
