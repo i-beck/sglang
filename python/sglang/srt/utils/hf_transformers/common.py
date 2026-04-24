@@ -307,34 +307,121 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         )
 
 
+def _load_deepseek_temp_model(
+    model_path: str,
+    model_type: str,
+    architecture: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    """Load a DeepSeek model config by rewriting model_type to deepseek_v3.
+
+    Used for model types that HF transformers doesn't recognise yet
+    (deepseek_v32, deepseek_v4 / deepseek_ref).  Optionally applies a
+    packaged backup config controlled by SGLANG_APPLY_CONFIG_BACKUP.
+    """
+    import tempfile
+
+    from sglang.srt.environ import envs
+
+    local_path = download_from_hf(model_path)
+
+    backup_mode = envs.SGLANG_APPLY_CONFIG_BACKUP.get()
+    if backup_mode == "auto":
+        real_config_file = os.path.join(local_path, "config.json")
+        if not os.path.exists(real_config_file):
+            raise RuntimeError(
+                f"SGLANG_APPLY_CONFIG_BACKUP=auto requires the checkpoint's "
+                f"config.json at {real_config_file} to read num_hidden_layers."
+            )
+        with open(real_config_file, "r") as f:
+            num_hidden_layers = json.load(f).get("num_hidden_layers")
+        if not isinstance(num_hidden_layers, int):
+            raise RuntimeError(
+                f"SGLANG_APPLY_CONFIG_BACKUP=auto could not read a numeric "
+                f"num_hidden_layers from {real_config_file} (got {num_hidden_layers!r})."
+            )
+        backup_mode = "small" if num_hidden_layers <= 50 else "large"
+        logger.warning(
+            f"SGLANG_APPLY_CONFIG_BACKUP=auto: checkpoint has "
+            f"num_hidden_layers={num_hidden_layers}, dispatching to {backup_mode!r}."
+        )
+
+    if backup_mode != "none":
+        backup_file = {
+            "small": "config_backup_small.json",
+            "large": "config_backup_large.json",
+        }.get(backup_mode)
+        if backup_file is None:
+            raise ValueError(
+                f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode!r} is not recognized; "
+                f"use 'none' (off), 'small', 'large', or 'auto'."
+            )
+        config_file = os.path.join(
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ),
+            "configs",
+            backup_file,
+        )
+        logger.warning(
+            f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode}: using packaged {config_file} "
+            f"instead of the checkpoint's config.json at {local_path}."
+        )
+    else:
+        config_file = os.path.join(local_path, "config.json")
+
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file at {config_file}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    config_json["architectures"] = [architecture]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"{model_type}_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
 def _load_deepseek_v32_model(
     model_path: str,
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     **kwargs,
 ):
-    import tempfile
+    return _load_deepseek_temp_model(
+        model_path,
+        model_type="deepseek_v32",
+        architecture="DeepseekV3ForCausalLM",
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
+    )
 
-    local_path = download_from_hf(model_path)
-    config_file = os.path.join(local_path, "config.json")
-    if not os.path.exists(config_file):
-        raise RuntimeError(f"Can't find config file in {local_path}.")
 
-    with open(config_file, "r") as f:
-        config_json = json.load(f)
-
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
-    config_json["model_type"] = "deepseek_v3"
-
-    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
-    os.makedirs(tmp_path, exist_ok=True)
-
-    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
-    with open(unique_path, "w") as f:
-        json.dump(config_json, f)
-
-    return AutoConfig.from_pretrained(
-        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+def _load_deepseek_v4_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    return _load_deepseek_temp_model(
+        model_path,
+        model_type="deepseek_ref",
+        architecture="DeepseekV4ForCausalLM",
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
     )
 
 

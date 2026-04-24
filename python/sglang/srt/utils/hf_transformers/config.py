@@ -30,6 +30,7 @@ from .common import (
     DeepseekVLV2Config,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
+    _load_deepseek_v4_model,
     _load_deepseek_v32_model,
     _override_v_head_dim_if_zero,
     check_gguf_file,
@@ -80,8 +81,16 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except (ValueError, KeyError) as e:
-            if "deepseek_v32" in str(e):
+            err_str = str(e)
+            if "deepseek_v32" in err_str:
                 config = _load_deepseek_v32_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif "deepseek_v4" in err_str or "deepseek_ref" in err_str:
+                config = _load_deepseek_v4_model(
                     model,
                     trust_remote_code=trust_remote_code,
                     revision=revision,
