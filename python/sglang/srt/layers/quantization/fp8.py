@@ -1289,7 +1289,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 unpacked = torch.empty(B, N, K, dtype=torch.int32, device=packed.device)
                 unpacked[:, :, 0::2] = (p & 0x0F).to(torch.int32)
                 unpacked[:, :, 1::2] = ((p >> 4) & 0x0F).to(torch.int32)
-                bf16_vals = F.embedding(unpacked, lut)  # [B, N, K] bfloat16
+                bf16_vals = F.embedding(unpacked, lut.unsqueeze(1)).squeeze(-1)  # [B, N, K] bfloat16
 
                 # Apply FP4 block scales (block_k=32) via reshape broadcast (no materialized expansion)
                 expert_scales = scales[e_start:e_end].float()  # [B, N, K//32]
