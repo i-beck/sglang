@@ -3,12 +3,14 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
@@ -238,29 +240,32 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: SWAKVPool,
+        kvcache: Union[SWAKVPool, DeepSeekV4TokenToKVPool],
         need_sort: bool,
     ):
-        assert isinstance(kvcache, SWAKVPool)
+        assert isinstance(kvcache, (SWAKVPool, DeepSeekV4TokenToKVPool))
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
 
+        full_kv_pool = getattr(kvcache, "full_kv_pool", None)
+        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+
         if page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(
                 size,
                 dtype,
                 device,
-                kvcache.full_kv_pool,
+                full_kv_pool,
                 need_sort,
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa,
                 dtype,
                 device,
-                kvcache.swa_kv_pool,
+                swa_kv_pool,
                 need_sort,
             )
         else:
@@ -273,7 +278,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size,
                 dtype,
                 device,
-                kvcache.full_kv_pool,
+                full_kv_pool,
                 need_sort,
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
@@ -281,7 +286,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size,
                 dtype,
                 device,
-                kvcache.swa_kv_pool,
+                swa_kv_pool,
                 need_sort,
             )
         # Note: append one more item of value -1 in the end so -1 maps to -1.

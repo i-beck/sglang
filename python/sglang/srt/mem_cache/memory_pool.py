@@ -185,7 +185,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size))
+        self.free_slots = list(range(1, self.size))
 
 
 class MambaPool:

@@ -3,6 +3,7 @@
 
 #pragma once
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/utils.cuh>
 
 namespace device::warp {
 
@@ -43,10 +44,10 @@ SGL_DEVICE T reduce_sum(T value, uint32_t active_mask = kFullMask) {
  * \param active_mask Bitmask of participating lanes (default: all 32).
  * \return The maximum across all active lanes.
  */
-template <typename T>
+template <uint32_t kNumThreads = kWarpThreads, typename T>
 SGL_DEVICE T reduce_max(T value, uint32_t active_mask = kFullMask) {
 #pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1)
+  for (int mask = kNumThreads / 2; mask > 0; mask >>= 1)
     value = math::max(value, __shfl_xor_sync(active_mask, value, mask, 32));
   return value;
 }

@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
@@ -111,6 +113,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -141,6 +144,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -173,6 +177,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -203,6 +208,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -261,6 +267,7 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            moe_runner_config.swiglu_limit,
         )
         return hidden_states
     else:
@@ -292,6 +299,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            swiglu_limit=moe_runner_config.swiglu_limit,
         )
 
 
@@ -756,6 +764,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -831,6 +840,7 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
     )
+
 
 
 def fused_moe(

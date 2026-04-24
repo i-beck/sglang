@@ -45,7 +45,7 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
         )
-        # Mock hf_config for _use_dpsk_v32_encoding check
+        # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
         self.model_config.hf_config = mock_hf_config

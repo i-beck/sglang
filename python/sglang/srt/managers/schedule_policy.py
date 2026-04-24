@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -424,8 +425,11 @@ class PrefillAdder:
                 ]
             )
 
+        # Hisparse wraps an SWATokenToKVPoolAllocator internally and exposes
+        # the full SWA allocator interface.
         self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, HiSparseTokenToKVPoolAllocator),
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
@@ -885,6 +889,13 @@ class PrefillAdder:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
                         )
+
+                now_input_len = trunc_len + len(req.prefix_indices)
+                now_input_len = now_input_len // self.page_size * self.page_size
+                trunc_len = now_input_len - len(req.prefix_indices)
+
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)

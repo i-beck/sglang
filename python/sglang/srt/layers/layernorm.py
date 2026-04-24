@@ -54,6 +54,7 @@ if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
+            from flashinfer.norm import rmsnorm as fi_rmsnorm
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
@@ -283,11 +284,15 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_hip:
+            if x.shape[0] == 0:
+                if residual is not None:
+                    return x, residual
+                return x
+
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
             fused_add_rms_norm(
                 output,
                 x,
