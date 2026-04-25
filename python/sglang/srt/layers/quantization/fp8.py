@@ -1241,6 +1241,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         FP4 DeepGEMM requires Blackwell (SM100+). On Hopper, we dequant
         FP4→BF16→FP8 with 128×128 block scales so the standard FP8 path works.
+
+        Memory strategy: stage packed FP4 data through CPU so the GPU copy
+        can be freed before allocating the larger FP8 tensor (~2× size).
         """
         from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
         from sglang.srt.utils.common import ceil_align
@@ -1259,53 +1262,59 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ]:
             weight_param = getattr(layer, weight_name)
             scale_param = getattr(layer, scale_name)
-
-            packed = weight_param.data  # [num_experts, N, K//2] int8
-            scales = scale_param.data  # [num_experts, N, K//32] float
-            num_experts, N, K_half = packed.shape
+            device = weight_param.device
+            num_experts, N, K_half = weight_param.data.shape
             K = K_half * 2
 
-            lut = _fp4_e2m1_lut.to(packed.device)
+            # Stage packed data to CPU, then free GPU memory for the larger FP8 tensor
+            packed_cpu = weight_param.data.cpu()
+            scales_cpu = scale_param.data.cpu()
+            setattr(layer, weight_name, None)
+            setattr(layer, scale_name, None)
+            del weight_param, scale_param
+            torch.cuda.empty_cache()
 
-            # Pre-allocate output tensors instead of list+stack
+            lut = _fp4_e2m1_lut.to(device)
+
+            # Allocate output tensors (now fits since old GPU tensors are freed)
             scale_rows = ceil_align(N, 128) // 128
             scale_cols = ceil_align(K, 128) // 128
             new_weight_tensor = torch.empty(
                 num_experts, N, K,
-                dtype=torch.float8_e4m3fn, device=packed.device,
+                dtype=torch.float8_e4m3fn, device=device,
             )
             new_scale_tensor = torch.empty(
                 num_experts, scale_rows, scale_cols,
-                dtype=torch.float32, device=packed.device,
+                dtype=torch.float32, device=device,
             )
 
-            # Mini-batch experts to reduce kernel launch overhead
-            batch_size = 8
-            for e_start in range(0, num_experts, batch_size):
-                e_end = min(e_start + batch_size, num_experts)
-                B = e_end - e_start
+            # Process one expert at a time to minimize GPU temp memory
+            for e in range(num_experts):
+                p = packed_cpu[e].to(device)  # [N, K//2] int8
+                s = scales_cpu[e].to(device)  # [N, K//32]
 
-                p = packed[e_start:e_end]  # [B, N, K//2] int8
+                # Unpack FP4 nibbles
+                unpacked = torch.empty(N, K, dtype=torch.int32, device=device)
+                unpacked[:, 0::2] = (p & 0x0F).to(torch.int32)
+                unpacked[:, 1::2] = ((p >> 4) & 0x0F).to(torch.int32)
+                del p
 
-                # Unpack FP4 nibbles — use int32 via F.embedding (halves index memory vs int64)
-                unpacked = torch.empty(B, N, K, dtype=torch.int32, device=packed.device)
-                unpacked[:, :, 0::2] = (p & 0x0F).to(torch.int32)
-                unpacked[:, :, 1::2] = ((p >> 4) & 0x0F).to(torch.int32)
-                bf16_vals = F.embedding(unpacked, lut.unsqueeze(1)).squeeze(-1)  # [B, N, K] bfloat16
+                bf16_vals = F.embedding(unpacked, lut.unsqueeze(1)).squeeze(-1)
+                del unpacked
 
-                # Apply FP4 block scales (block_k=32) via reshape broadcast (no materialized expansion)
-                expert_scales = scales[e_start:e_end].float()  # [B, N, K//32]
-                scaled_vals = bf16_vals.float() * expert_scales.unsqueeze(-1).expand(
-                    B, N, K // 32, 32
-                ).reshape(B, N, K)
+                # Apply FP4 block scales (block_k=32) via reshape broadcast
+                scaled_vals = bf16_vals.float() * s.float().unsqueeze(-1).expand(
+                    N, K // 32, 32
+                ).reshape(N, K)
+                del bf16_vals, s
 
-                # Re-quantize each expert to FP8 (pass float32 directly, no lossy bf16 truncation)
-                for i in range(B):
-                    fp8_w, fp8_s = per_block_cast_to_fp8(scaled_vals[i])
-                    new_weight_tensor[e_start + i] = fp8_w
-                    new_scale_tensor[e_start + i] = fp8_s
+                fp8_w, fp8_s = per_block_cast_to_fp8(scaled_vals)
+                del scaled_vals
+                new_weight_tensor[e] = fp8_w
+                new_scale_tensor[e] = fp8_s
+                del fp8_w, fp8_s
 
-                del unpacked, bf16_vals, scaled_vals, expert_scales
+            del packed_cpu, scales_cpu
 
             setattr(layer, weight_name, Parameter(new_weight_tensor, requires_grad=False))
             setattr(layer, scale_name, Parameter(new_scale_tensor, requires_grad=False))
