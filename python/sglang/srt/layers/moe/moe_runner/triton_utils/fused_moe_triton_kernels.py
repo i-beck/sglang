@@ -91,6 +91,22 @@ def write_zeros_to_output(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+_FP4_E2M1_LUT: Optional[torch.Tensor] = None
+
+
+def _get_fp4_lut(device: torch.device) -> torch.Tensor:
+    """Return a cached 16-element float32 LUT for FP4 E2M1 dequantization."""
+    global _FP4_E2M1_LUT
+    if _FP4_E2M1_LUT is None or _FP4_E2M1_LUT.device != device:
+        _FP4_E2M1_LUT = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            dtype=torch.float32,
+            device=device,
+        )
+    return _FP4_E2M1_LUT
+
+
 @triton.jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
@@ -99,6 +115,7 @@ def fused_moe_kernel_gptq_awq(
     c_ptr,
     b_scale_ptr,
     b_zp_ptr,
+    lut_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -139,6 +156,7 @@ def fused_moe_kernel_gptq_awq(
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
+    use_fp4_e2m1: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -297,7 +315,11 @@ def fused_moe_kernel_gptq_awq(
             b_zp = b_zp.to(tl.float32)
 
         # We accumulate along the K dimension.
-        if has_zp:
+        if use_fp4_e2m1:
+            b_idx = b.to(tl.int32)
+            b_float = tl.load(lut_ptr + b_idx)
+            b = (b_float * b_scale).to(compute_type)
+        elif has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
@@ -734,6 +756,7 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    use_fp4_e2m1: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -783,6 +806,8 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+    elif use_fp4_e2m1:
+        assert B_scale is not None
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
@@ -812,7 +837,7 @@ def invoke_fused_moe_kernel(
         ), "add_output_mask required when fuse_add_to_output=True"
 
     if (
-        (use_int8_w8a16 or use_int4_w4a16)
+        (use_int8_w8a16 or use_int4_w4a16 or use_fp4_e2m1)
         and block_shape is not None
         and block_shape[1] > 0
     ):
@@ -822,12 +847,14 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
+        fp4_lut = _get_fp4_lut(A.device) if use_fp4_e2m1 else None
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
             C,
             B_scale,
             B_zp,
+            fp4_lut,
             topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -854,10 +881,11 @@ def invoke_fused_moe_kernel(
             top_k=top_k,
             compute_type=compute_type,
             has_zp=B_zp is not None,
-            use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a16=use_int4_w4a16 or use_fp4_e2m1,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,
+            use_fp4_e2m1=use_fp4_e2m1,
             **config,
         )
 

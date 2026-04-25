@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_moe_a2a_backend,
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
@@ -829,7 +830,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_deep_gemm():
@@ -1173,11 +1173,53 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-                # On Hopper (SM90), dequant FP4→FP8 since FP4 GEMM needs SM100+
-                # This applies regardless of runner backend (DeepGEMM or Triton)
-                # because no SM90 runner supports FP4 packed weights
+                # On Hopper (SM90), keep packed FP4 weights and use Triton
+                # kernel with LUT dequant instead of expanding to FP8 (saves ~44GB).
+                # Only supported with A2A=none (StandardDispatcher) since there are
+                # no Triton pre_permute/post_permute registrations for DeepEP/Mooncake/NIXL
+                # dispatch formats.
                 if not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
-                    self._dequant_fp4_experts_to_fp8(layer)
+                    if not get_moe_a2a_backend().is_none():
+                        raise NotImplementedError(
+                            "FP4 expert weights on Hopper (SM90) require A2A backend 'none'. "
+                            f"Current A2A backend: {get_moe_a2a_backend()}. "
+                            "FP4 Triton LUT dequant only has dispatch registrations for "
+                            "StandardDispatcher (A2A=none), not DeepEP/Mooncake/NIXL."
+                        )
+                    # FP4 Triton expects standard TopK output format. Backends
+                    # like triton_kernels and flashinfer_trtllm produce
+                    # non-standard formats (TritonKernelTopKOutput, BypassedTopKOutput)
+                    # that the forced Triton runner cannot consume.
+                    # auto is safe: it resolves to deep_gemm or triton in
+                    # create_moe_runner() and produces standard TopK.
+                    moe_backend = get_moe_runner_backend()
+                    _safe_backends = (
+                        moe_backend.is_auto()
+                        or moe_backend.is_triton()
+                        or moe_backend.is_cutlass()
+                        or moe_backend.is_deep_gemm()
+                    )
+                    if not _safe_backends:
+                        raise NotImplementedError(
+                            "FP4 Triton LUT dequant on Hopper requires a runner backend "
+                            "that produces standard TopK output (auto, triton, cutlass, or deep_gemm). "
+                            f"Current backend: {moe_backend}"
+                        )
+                    self.use_fp4_triton = True
+                    # Null out routed_scaling_factor in the runner config so the
+                    # Triton runner doesn't apply it — the model/topk layer handles
+                    # scaling via should_fuse_routed_scaling_factor_in_topk, which
+                    # was computed from the original backend before we forced Triton.
+                    self.moe_runner_config.routed_scaling_factor = None
+                    # Force Triton runner regardless of original backend
+                    # (Cutlass/DeepGEMM don't support packed FP4)
+                    self.runner = MoeRunner(
+                        MoeRunnerBackend.TRITON, self.moe_runner_config
+                    )
+                    log_info_on_rank0(
+                        logger,
+                        "Keeping FP4 expert weights packed for Triton LUT dequant (SM90)",
+                    )
                     return
 
                 if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
@@ -1235,93 +1277,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
-
-    def _dequant_fp4_experts_to_fp8(self, layer: Module) -> None:
-        """Dequantize FP4 (E2M1) expert weights to FP8 for Hopper (SM90).
-
-        FP4 DeepGEMM requires Blackwell (SM100+). On Hopper, we dequant
-        FP4→BF16→FP8 with 128×128 block scales so the standard FP8 path works.
-
-        Memory strategy: stage packed FP4 data through CPU so the GPU copy
-        can be freed before allocating the larger FP8 tensor (~2× size).
-        """
-        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
-        from sglang.srt.utils.common import ceil_align
-
-        # FP4 E2M1 lookup table: 4-bit index → float value
-        # Matches deep_gemm.utils.math._dequantize_from_fp4_e2m1
-        _fp4_e2m1_lut = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            dtype=torch.bfloat16,
-        )
-
-        for weight_name, scale_name in [
-            ("w13_weight", "w13_weight_scale_inv"),
-            ("w2_weight", "w2_weight_scale_inv"),
-        ]:
-            weight_param = getattr(layer, weight_name)
-            scale_param = getattr(layer, scale_name)
-            device = weight_param.device
-            num_experts, N, K_half = weight_param.data.shape
-            K = K_half * 2
-
-            # Stage packed data to CPU, then free GPU memory for the larger FP8 tensor
-            packed_cpu = weight_param.data.cpu()
-            scales_cpu = scale_param.data.cpu()
-            setattr(layer, weight_name, None)
-            setattr(layer, scale_name, None)
-            del weight_param, scale_param
-            torch.cuda.empty_cache()
-
-            lut = _fp4_e2m1_lut.to(device)
-
-            # Allocate output tensors (now fits since old GPU tensors are freed)
-            scale_rows = ceil_align(N, 128) // 128
-            scale_cols = ceil_align(K, 128) // 128
-            new_weight_tensor = torch.empty(
-                num_experts, N, K,
-                dtype=torch.float8_e4m3fn, device=device,
-            )
-            new_scale_tensor = torch.empty(
-                num_experts, scale_rows, scale_cols,
-                dtype=torch.float32, device=device,
-            )
-
-            # Process one expert at a time to minimize GPU temp memory
-            for e in range(num_experts):
-                p = packed_cpu[e].to(device)  # [N, K//2] int8
-                s = scales_cpu[e].to(device)  # [N, K//32]
-
-                # Unpack FP4 nibbles
-                unpacked = torch.empty(N, K, dtype=torch.int32, device=device)
-                unpacked[:, 0::2] = (p & 0x0F).to(torch.int32)
-                unpacked[:, 1::2] = ((p >> 4) & 0x0F).to(torch.int32)
-                del p
-
-                bf16_vals = F.embedding(unpacked, lut.unsqueeze(1)).squeeze(-1)
-                del unpacked
-
-                # Apply FP4 block scales (block_k=32) via reshape broadcast
-                scaled_vals = bf16_vals.float() * s.float().unsqueeze(-1).expand(
-                    N, K // 32, 32
-                ).reshape(N, K)
-                del bf16_vals, s
-
-                fp8_w, fp8_s = per_block_cast_to_fp8(scaled_vals)
-                del scaled_vals
-                new_weight_tensor[e] = fp8_w
-                new_scale_tensor[e] = fp8_s
-                del fp8_w, fp8_s
-
-            del packed_cpu, scales_cpu
-
-            setattr(layer, weight_name, Parameter(new_weight_tensor, requires_grad=False))
-            setattr(layer, scale_name, Parameter(new_scale_tensor, requires_grad=False))
-            getattr(layer, scale_name).format_ue8m0 = False
-
-        self.is_fp4_expert = False
-        logger.info("Converted FP4 expert weights to FP8 for Hopper (SM90)")
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -1730,6 +1685,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        if getattr(self, "use_fp4_triton", False):
+            return TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp4_e2m1=True,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                block_shape=[0, 32],
+            )
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -1795,6 +1759,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
+
+        if getattr(self, "use_fp4_triton", False):
+            # FP4 on Hopper: Triton runner was forced at setup time,
+            # use LUT dequant before any other backend check.
+            quant_info = self.get_triton_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8

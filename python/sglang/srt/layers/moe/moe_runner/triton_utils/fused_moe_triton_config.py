@@ -153,7 +153,22 @@ def get_default_config(
             "GROUP_SIZE_M": 8,
         }
         return config
-    if dtype == "fp8_w8a8":
+    if dtype == "fp4_e2m1":
+        config = {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+        }
+        if M <= E:
+            config = {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 1,
+            }
+        return config
+    elif dtype == "fp8_w8a8":
         if block_shape is None:
             config = {
                 "BLOCK_SIZE_M": 128,
@@ -274,8 +289,11 @@ def get_config_dtype_str(
     use_int4_w4a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
+    use_fp4_e2m1: Optional[bool] = False,
 ):
-    if use_fp8_w8a8:
+    if use_fp4_e2m1:
+        return "fp4_e2m1"
+    elif use_fp8_w8a8:
         return "fp8_w8a8"
     elif use_int8_w8a8:
         return "int8_w8a8"
