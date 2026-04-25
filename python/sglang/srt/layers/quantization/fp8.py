@@ -1686,6 +1686,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         if getattr(self, "use_fp4_triton", False):
+            # Convert E8M0 exponent scales to float32 multipliers on first call
+            if not getattr(layer, "_fp4_scales_converted", False):
+                import torch as _torch
+                layer.w13_weight_scale_inv.data = _torch.exp2(
+                    layer.w13_weight_scale_inv.data.float() - 127.0
+                )
+                layer.w2_weight_scale_inv.data = _torch.exp2(
+                    layer.w2_weight_scale_inv.data.float() - 127.0
+                )
+                layer._fp4_scales_converted = True
             return TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,

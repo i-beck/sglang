@@ -461,7 +461,9 @@ class MQALayer(nn.Module):
                 config.compress_rope_theta == 160000
             ), f"{config.compress_rope_theta=}"
         rope_base = (
-            config.compress_rope_theta if self.compress_ratio else config.rope_theta
+            config.compress_rope_theta
+            if self.compress_ratio
+            else getattr(config, "rope_theta", config.compress_rope_theta)
         )
 
         self.rotary_emb = get_rope_wrapper(

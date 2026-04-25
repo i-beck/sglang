@@ -542,6 +542,11 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
             )
         elif gemm1_limit is not None:
+            from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                deepseek_v4_moe_code_path_checker,
+            )
+
+            deepseek_v4_moe_code_path_checker.observed += 1
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
@@ -816,6 +821,10 @@ def fused_experts_impl(
         block_shape=block_shape,
     )
 
+    # swiglu_limit and gemm1_limit serve the same clamping purpose;
+    # merge so _fused_moe_kernel_sequence sees the limit via gemm1_limit.
+    effective_gemm1_limit = gemm1_limit if gemm1_limit is not None else swiglu_limit
+
     return _fused_moe_kernel_sequence(
         hidden_states,
         w1,
@@ -850,7 +859,7 @@ def fused_experts_impl(
         apply_router_weight_on_input=apply_router_weight_on_input,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
-        gemm1_limit=gemm1_limit,
+        gemm1_limit=effective_gemm1_limit,
         filter_expert=filter_expert,
         hooks=None,
     )
