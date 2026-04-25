@@ -1173,8 +1173,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-                # On Hopper (SM90), dequant FP4→FP8 since FP4 DeepGEMM needs SM100+
-                if not deep_gemm_wrapper.DEEPGEMM_BLACKWELL and will_use_deepgemm:
+                # On Hopper (SM90), dequant FP4→FP8 since FP4 GEMM needs SM100+
+                # This applies regardless of runner backend (DeepGEMM or Triton)
+                # because no SM90 runner supports FP4 packed weights
+                if not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
                     self._dequant_fp4_experts_to_fp8(layer)
                     return
 
