@@ -1216,9 +1216,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     self.runner = MoeRunner(
                         MoeRunnerBackend.TRITON, self.moe_runner_config
                     )
+                    s13 = layer.w13_weight_scale_inv.data
+                    s2 = layer.w2_weight_scale_inv.data
                     log_info_on_rank0(
                         logger,
-                        "Keeping FP4 expert weights packed for Triton LUT dequant (SM90)",
+                        f"Keeping FP4 expert weights packed for Triton LUT dequant (SM90)\n"
+                        f"  w13_scale shape={s13.shape} dtype={s13.dtype} "
+                        f"min={s13.min().item():.6e} max={s13.max().item():.6e} "
+                        f"mean={s13.mean().item():.6e}\n"
+                        f"  w13_scale[0,0,:4]={s13[0,0,:4].tolist()}\n"
+                        f"  w2_scale shape={s2.shape} dtype={s2.dtype} "
+                        f"min={s2.min().item():.6e} max={s2.max().item():.6e}",
                     )
                     return
 
@@ -1686,16 +1694,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         if getattr(self, "use_fp4_triton", False):
-            # Convert E8M0 exponent scales to float32 multipliers on first call
-            if not getattr(layer, "_fp4_scales_converted", False):
-                import torch as _torch
-                layer.w13_weight_scale_inv.data = _torch.exp2(
-                    layer.w13_weight_scale_inv.data.float() - 127.0
-                )
-                layer.w2_weight_scale_inv.data = _torch.exp2(
-                    layer.w2_weight_scale_inv.data.float() - 127.0
-                )
-                layer._fp4_scales_converted = True
             return TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
