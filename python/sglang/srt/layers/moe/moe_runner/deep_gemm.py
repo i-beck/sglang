@@ -52,7 +52,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 if not (_is_npu or _is_hip) and _is_cuda:
-    pass
+    from sglang.jit_kernel.activation import silu_and_mul
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
 if not (_is_npu or _is_hip):

@@ -28,7 +28,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -49,7 +48,9 @@ _is_musa = is_musa()
 
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+    from sgl_kernel import moe_sum_reduce
+
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -99,7 +100,6 @@ def inplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    use_fp4_e2m1: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -112,7 +112,6 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
-    swiglu_limit: Optional[float] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -143,8 +142,6 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
-        swiglu_limit=swiglu_limit,
-        use_fp4_e2m1=use_fp4_e2m1,
     )
 
 
@@ -164,7 +161,6 @@ def outplace_fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    use_fp4_e2m1: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -178,7 +174,6 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
-    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -209,8 +204,6 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
-        swiglu_limit=swiglu_limit,
-        use_fp4_e2m1=use_fp4_e2m1,
     )
 
 
@@ -226,7 +219,6 @@ def fused_experts(
     use_int8_w8a8: bool = False,
     use_int8_w8a16: bool = False,
     use_int4_w4a16: bool = False,
-    use_fp4_e2m1: bool = False,
     per_channel_quant: bool = False,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -258,7 +250,6 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
-            use_fp4_e2m1,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -271,7 +262,6 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
-            moe_runner_config.swiglu_limit,
         )
         return hidden_states
     else:
@@ -290,7 +280,6 @@ def fused_experts(
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
-            use_fp4_e2m1,
             per_channel_quant,
             w1_scale,
             w2_scale,
@@ -304,7 +293,6 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
-            swiglu_limit=moe_runner_config.swiglu_limit,
         )
 
 
@@ -324,7 +312,7 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
 
 
 @torch.compile
-def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
     gate, up = x[..., ::2], x[..., 1::2]
@@ -348,7 +336,6 @@ def _prepare_fused_moe_run(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
-    use_fp4_e2m1: bool = False,
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
 ):
@@ -368,7 +355,6 @@ def _prepare_fused_moe_run(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
-        use_fp4_e2m1=use_fp4_e2m1,
         dtype=hidden_states.dtype,
     )
 
@@ -422,7 +408,6 @@ def _fused_moe_kernel_sequence(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     per_channel_quant: bool,
-    use_fp4_e2m1: bool = False,
     w1_scale: Optional[torch.Tensor],
     w2_scale: Optional[torch.Tensor],
     w1_zp: Optional[torch.Tensor],
@@ -477,7 +462,6 @@ def _fused_moe_kernel_sequence(
         and (topk > 2)
         and (not use_int8_w8a16)
         and (not use_int4_w4a16)
-        and (not use_fp4_e2m1)
     )
 
     intermediate_cache1 = torch.empty(
@@ -511,7 +495,6 @@ def _fused_moe_kernel_sequence(
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
-        use_fp4_e2m1=use_fp4_e2m1,
     )
 
     if hooks and hooks.after_gate_up:
@@ -538,31 +521,25 @@ def _fused_moe_kernel_sequence(
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+            intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
             )
         elif gemm1_limit is not None:
-            from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-                deepseek_v4_moe_code_path_checker,
-            )
-
-            deepseek_v4_moe_code_path_checker.observed += 1
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif _is_cuda or _is_hip or _is_xpu:
-            if not filter_expert:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
+                silu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
@@ -579,18 +556,15 @@ def _fused_moe_kernel_sequence(
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
-            if not filter_expert:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
                 vllm_ops.gelu_and_mul(
@@ -664,7 +638,6 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
-        use_fp4_e2m1=use_fp4_e2m1,
     )
 
     if hooks and hooks.after_down:
@@ -780,15 +753,13 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
-    swiglu_limit: Optional[float] = None,
-    use_fp4_e2m1: bool = False,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
     # Check constraints.
-    if use_int4_w4a16 or use_fp4_e2m1:
+    if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
@@ -816,14 +787,9 @@ def fused_experts_impl(
         use_int8_w8a8=use_int8_w8a8,
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
-        use_fp4_e2m1=use_fp4_e2m1,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
     )
-
-    # swiglu_limit and gemm1_limit serve the same clamping purpose;
-    # merge so _fused_moe_kernel_sequence sees the limit via gemm1_limit.
-    effective_gemm1_limit = gemm1_limit if gemm1_limit is not None else swiglu_limit
 
     return _fused_moe_kernel_sequence(
         hidden_states,
@@ -844,7 +810,6 @@ def fused_experts_impl(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
-        use_fp4_e2m1=use_fp4_e2m1,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_zp=w1_zp,
@@ -859,7 +824,7 @@ def fused_experts_impl(
         apply_router_weight_on_input=apply_router_weight_on_input,
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
-        gemm1_limit=effective_gemm1_limit,
+        gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
         hooks=None,
     )

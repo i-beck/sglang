@@ -202,6 +202,18 @@ class PrefillBootstrapQueue:
                     )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
+                if self.draft_token_to_kv_pool is not None and isinstance(
+                    self.draft_token_to_kv_pool, NSATokenToKVPool
+                ):
+                    (
+                        draft_state_data_ptrs,
+                        draft_state_data_lens,
+                        draft_state_item_lens,
+                    ) = self.draft_token_to_kv_pool.get_state_buf_infos()
+                    kv_args.state_data_ptrs += draft_state_data_ptrs
+                    kv_args.state_data_lens += draft_state_data_lens
+                    kv_args.state_item_lens += draft_state_item_lens
+
             else:
                 kv_args.state_type = "none"
         else:
@@ -408,7 +420,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             if self._engine_paused:
-                self.process_disagg_prefill_inflight_queue()
                 continue
 
             # Get the next batch to run
@@ -442,7 +453,6 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             if self._engine_paused:
-                self.process_disagg_prefill_inflight_queue()
                 continue
 
             # Get the next batch to run
@@ -500,6 +510,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue

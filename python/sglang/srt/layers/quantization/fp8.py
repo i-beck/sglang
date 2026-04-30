@@ -51,7 +51,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    _use_aiter_gfx95,
+    _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -528,7 +528,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            _use_aiter_gfx95
+            _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
@@ -1173,63 +1173,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
-                # On Hopper (SM90), keep packed FP4 weights and use Triton
-                # kernel with LUT dequant instead of expanding to FP8 (saves ~44GB).
-                # Only supported with A2A=none (StandardDispatcher) since there are
-                # no Triton pre_permute/post_permute registrations for DeepEP/Mooncake/NIXL
-                # dispatch formats.
-                if not deep_gemm_wrapper.DEEPGEMM_BLACKWELL:
-                    if not get_moe_a2a_backend().is_none():
-                        raise NotImplementedError(
-                            "FP4 expert weights on Hopper (SM90) require A2A backend 'none'. "
-                            f"Current A2A backend: {get_moe_a2a_backend()}. "
-                            "FP4 Triton LUT dequant only has dispatch registrations for "
-                            "StandardDispatcher (A2A=none), not DeepEP/Mooncake/NIXL."
-                        )
-                    # FP4 Triton expects standard TopK output format. Backends
-                    # like triton_kernels and flashinfer_trtllm produce
-                    # non-standard formats (TritonKernelTopKOutput, BypassedTopKOutput)
-                    # that the forced Triton runner cannot consume.
-                    # auto is safe: it resolves to deep_gemm or triton in
-                    # create_moe_runner() and produces standard TopK.
-                    moe_backend = get_moe_runner_backend()
-                    _safe_backends = (
-                        moe_backend.is_auto()
-                        or moe_backend.is_triton()
-                        or moe_backend.is_cutlass()
-                        or moe_backend.is_deep_gemm()
-                    )
-                    if not _safe_backends:
-                        raise NotImplementedError(
-                            "FP4 Triton LUT dequant on Hopper requires a runner backend "
-                            "that produces standard TopK output (auto, triton, cutlass, or deep_gemm). "
-                            f"Current backend: {moe_backend}"
-                        )
-                    self.use_fp4_triton = True
-                    # Null out routed_scaling_factor in the runner config so the
-                    # Triton runner doesn't apply it — the model/topk layer handles
-                    # scaling via should_fuse_routed_scaling_factor_in_topk, which
-                    # was computed from the original backend before we forced Triton.
-                    self.moe_runner_config.routed_scaling_factor = None
-                    # Force Triton runner regardless of original backend
-                    # (Cutlass/DeepGEMM don't support packed FP4)
-                    self.runner = MoeRunner(
-                        MoeRunnerBackend.TRITON, self.moe_runner_config
-                    )
-                    s13 = layer.w13_weight_scale_inv.data
-                    s2 = layer.w2_weight_scale_inv.data
-                    log_info_on_rank0(
-                        logger,
-                        f"Keeping FP4 expert weights packed for Triton LUT dequant (SM90)\n"
-                        f"  w13_scale shape={s13.shape} dtype={s13.dtype} "
-                        f"min={s13.min().item():.6e} max={s13.max().item():.6e} "
-                        f"mean={s13.mean().item():.6e}\n"
-                        f"  w13_scale[0,0,:4]={s13[0,0,:4].tolist()}\n"
-                        f"  w2_scale shape={s2.shape} dtype={s2.dtype} "
-                        f"min={s2.min().item():.6e} max={s2.max().item():.6e}",
-                    )
-                    return
-
                 if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
                     from sglang.srt.models.deepseek_v4 import (
                         build_mega_moe_experts_weights,
@@ -1693,15 +1636,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             pass
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
-        if getattr(self, "use_fp4_triton", False):
-            return TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp4_e2m1=True,
-                w13_scale=layer.w13_weight_scale_inv,
-                w2_scale=layer.w2_weight_scale_inv,
-                block_shape=[0, 32],
-            )
         return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
@@ -1767,12 +1701,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
-
-        if getattr(self, "use_fp4_triton", False):
-            # FP4 on Hopper: Triton runner was forced at setup time,
-            # use LUT dequant before any other backend check.
-            quant_info = self.get_triton_quant_info(layer)
-            return self.runner.run(dispatch_output, quant_info)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
@@ -1861,6 +1789,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
+
+            activation_type = get_activation_type(self.moe_runner_config.activation)
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -1901,6 +1835,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
+                activation_type=activation_type,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)

@@ -9,9 +9,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -91,22 +88,6 @@ def write_zeros_to_output(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-_FP4_E2M1_LUT: Optional[torch.Tensor] = None
-
-
-def _get_fp4_lut(device: torch.device) -> torch.Tensor:
-    """Return a cached 16-element float32 LUT for FP4 E2M1 dequantization."""
-    global _FP4_E2M1_LUT
-    if _FP4_E2M1_LUT is None or _FP4_E2M1_LUT.device != device:
-        _FP4_E2M1_LUT = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-             0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            dtype=torch.float32,
-            device=device,
-        )
-    return _FP4_E2M1_LUT
-
-
 @triton.jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
@@ -115,7 +96,6 @@ def fused_moe_kernel_gptq_awq(
     c_ptr,
     b_scale_ptr,
     b_zp_ptr,
-    lut_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -156,7 +136,6 @@ def fused_moe_kernel_gptq_awq(
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
-    use_fp4_e2m1: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -315,11 +294,7 @@ def fused_moe_kernel_gptq_awq(
             b_zp = b_zp.to(tl.float32)
 
         # We accumulate along the K dimension.
-        if use_fp4_e2m1:
-            b_idx = b.to(tl.int32)
-            b_float = tl.load(lut_ptr + b_idx)
-            b = (b_float * b_scale).to(compute_type)
-        elif has_zp:
+        if has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
@@ -756,7 +731,6 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
-    use_fp4_e2m1: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -806,8 +780,6 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
-    elif use_fp4_e2m1:
-        assert B_scale is not None
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
@@ -837,7 +809,7 @@ def invoke_fused_moe_kernel(
         ), "add_output_mask required when fuse_add_to_output=True"
 
     if (
-        (use_int8_w8a16 or use_int4_w4a16 or use_fp4_e2m1)
+        (use_int8_w8a16 or use_int4_w4a16)
         and block_shape is not None
         and block_shape[1] > 0
     ):
@@ -847,14 +819,12 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
-        fp4_lut = _get_fp4_lut(A.device) if use_fp4_e2m1 else None
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
             C,
             B_scale,
             B_zp,
-            fp4_lut,
             topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -881,11 +851,10 @@ def invoke_fused_moe_kernel(
             top_k=top_k,
             compute_type=compute_type,
             has_zp=B_zp is not None,
-            use_int4_w4a16=use_int4_w4a16 or use_fp4_e2m1,
+            use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,
-            use_fp4_e2m1=use_fp4_e2m1,
             **config,
         )
 
@@ -959,126 +928,6 @@ def invoke_fused_moe_kernel(
             ROUTER_TOPK=router_topk,
             **config,
         )
-
-
-@triton.jit
-def tanh(x):
-    return 2 * tl.sigmoid(2 * x) - 1
-
-
-@triton.jit
-def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
-    """
-    Apply activation function based on compile-time constant.
-
-    Args:
-        x: Input tensor (converted to float32 inside)
-        ACTIVATION_TYPE: Compile-time constant string ("silu" or "gelu")
-
-    Returns:
-        Activated output in the same dtype as input
-    """
-    x = x.to(tl.float32)
-    if ACTIVATION_TYPE == "silu":
-        return x * tl.sigmoid(x)
-    elif ACTIVATION_TYPE == "gelu":
-        kAlpha = 0.7978845608028654
-        return 0.5 * x * (1 + tanh(kAlpha * (x + 0.044715 * x * x * x)))
-    else:
-        raise ValueError(f"Unsupported activation: {ACTIVATION_TYPE}")
-
-
-@triton.jit
-def act_and_mul_kernel(
-    gateup_output,
-    down_input,
-    hidden_size,
-    expert_ids_ptr,
-    expert_step: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    ACTIVATION_TYPE: tl.constexpr,
-    SWIGLU_LIMIT: tl.constexpr = 0.0,
-    HAS_SWIGLU_LIMIT: tl.constexpr = False,
-):
-    """
-    Unified activation and multiply kernel that handles both sorted and unsorted routing,
-    and both SiLU and GELU activations using compile-time constants.
-    """
-    InDtype = gateup_output.dtype.element_ty
-    OutDtype = down_input.dtype.element_ty
-
-    half_hidden_size = hidden_size // 2
-    pid = tl.program_id(0)
-
-    expert_id = tl.load(expert_ids_ptr + pid // expert_step)
-
-    if expert_id == -1:
-        return
-
-    gateup_output_ptr = gateup_output + pid * hidden_size
-    down_input_ptr = down_input + pid * half_hidden_size
-    gate_output_ptr = gateup_output_ptr
-    up_output_ptr = gateup_output_ptr + half_hidden_size
-
-    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
-        mask = offset < half_hidden_size
-
-        gate_output = tl.load(gate_output_ptr + offset, mask=mask)
-        up_output = tl.load(up_output_ptr + offset, mask=mask)
-
-        if HAS_SWIGLU_LIMIT:
-            gate_output = tl.minimum(gate_output, SWIGLU_LIMIT)
-            up_output = tl.maximum(tl.minimum(up_output, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-
-        gate_output_activated = _apply_activation(gate_output, ACTIVATION_TYPE)
-        gate_output_activated = gate_output_activated.to(InDtype)
-
-        act_mul_output = gate_output_activated * up_output
-        act_mul_output = act_mul_output.to(OutDtype)
-        tl.store(down_input_ptr + offset, act_mul_output, mask=mask)
-
-
-def act_and_mul_triton(
-    gateup_output: torch.Tensor,
-    down_input: torch.Tensor,
-    config: Dict[str, Any],
-    topk_ids: Optional[torch.Tensor] = None,
-    expert_ids: Optional[torch.Tensor] = None,
-    down_moe_use_tma: bool = False,
-    activation: str = "silu",
-    swiglu_limit: Optional[float] = None,
-) -> None:
-    """
-    Args:
-        gateup_output: Input tensor containing gate and up outputs concatenated
-        down_input: Output tensor for the result
-        config: Configuration dictionary with BLOCK_SIZE_M and BLOCK_SIZE_N
-        topk_ids: Expert IDs for unsorted routing (used when down_moe_use_tma=False)
-        expert_ids: Expert IDs for sorted routing (used when down_moe_use_tma=True)
-        down_moe_use_tma: Whether to use sorted routing layout
-        activation: Activation type ("silu" or "gelu")
-        swiglu_limit: if not None, clamp gate to [-inf, L] and up to [-L, L] before activation
-                      (compiles a separate kernel variant via tl.constexpr).
-    """
-    grid = (down_input.shape[0],)
-    hidden_size = gateup_output.shape[1]
-    expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
-    expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
-    has_swiglu_limit = swiglu_limit is not None
-    if has_swiglu_limit:
-        deepseek_v4_moe_code_path_checker.observed += 1
-    act_and_mul_kernel[grid](
-        gateup_output,
-        down_input,
-        hidden_size,
-        expert_ids_row,
-        expert_step,
-        BLOCK_SIZE=512,
-        ACTIVATION_TYPE=activation,
-        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
-        HAS_SWIGLU_LIMIT=has_swiglu_limit,
-    )
 
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
