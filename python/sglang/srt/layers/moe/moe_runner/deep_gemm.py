@@ -55,7 +55,12 @@ if not (_is_npu or _is_hip) and _is_cuda:
     pass
 
 # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
-if not (_is_npu or _is_hip):
+if get_bool_env_var("SGLANG_TEST_SKIP_OPTIONAL_GPU_IMPORTS"):
+    _enable_legacy_silu_import = _is_cuda and not (_is_npu or _is_hip)
+else:
+    _enable_legacy_silu_import = not (_is_npu or _is_hip)
+
+if _enable_legacy_silu_import:
     from sgl_kernel import silu_and_mul as _legacy_silu_and_mul
 else:
     _legacy_silu_and_mul = None
