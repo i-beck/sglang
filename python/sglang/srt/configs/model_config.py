@@ -543,6 +543,7 @@ class ModelConfig:
         )
 
         if not self.is_hybrid_swa:
+            self.has_attention_sinks = False
             return
 
         logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
