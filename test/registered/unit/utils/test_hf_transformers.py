@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from transformers import PretrainedConfig
 
 from sglang.srt.utils.hf_transformers.common import (
+    _CONFIG_REGISTRY,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -20,6 +21,7 @@ from sglang.srt.utils.hf_transformers.common import (
     get_hf_text_config,
     get_rope_config,
 )
+from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_Omni_Reasoning_V3_Config
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -448,6 +450,15 @@ class TestModuleReExports(unittest.TestCase):
                 hasattr(shim, name),
                 f"{name} not available through shim module hf_transformers_utils",
             )
+
+
+class TestConfigRegistry(unittest.TestCase):
+    def test_nemotron_omni_config_registered(self):
+        self.assertIn("NemotronH_Nano_Omni_Reasoning_V3", _CONFIG_REGISTRY)
+        self.assertIs(
+            _CONFIG_REGISTRY["NemotronH_Nano_Omni_Reasoning_V3"],
+            NemotronH_Nano_Omni_Reasoning_V3_Config,
+        )
 
 
 # ---------------------------------------------------------------------------
